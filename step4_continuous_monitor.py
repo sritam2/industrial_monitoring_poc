@@ -20,10 +20,11 @@ load_dotenv()
 monitoring_active = True
 display_window_name = "Industrial Monitoring System"
 stream_window_name = "Live Camera Feed"
+status_window_name = "Slot Status"  # Add status window name
 camera_stream = None  # Global reference to camera stream
 
 class CameraStream:
-    def __init__(self, camera_index=0):
+    def __init__(self, camera_index=1):
         """Initialize camera stream thread"""
         self.camera_index = camera_index
         self.frame = None
@@ -45,7 +46,20 @@ class CameraStream:
             print("❌ Failed to open camera in stream thread")
             self.stopped = True
             return
-            
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920) # Set resolution early
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FPS, 30) # Set standard FPS
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # Reduce buffer size for lower latency
+
+        # Create and position the window
+        cv2.namedWindow(stream_window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(stream_window_name, 920, 530)  # Set window size to 640x480
+        cv2.moveWindow(stream_window_name, 0, 600)  # Position at (0, 600)
+
+        # cv2.namedWindow(status_window_name, cv2.WINDOW_NORMAL)
+        # cv2.resizeWindow(status_window_name, 920, 530)  # Set window size to 640x480
+        # cv2.moveWindow(status_window_name, 0,0)  # Position at (0, 600)
+
         while not self.stopped:
             ret, frame = cap.read()
             if ret:
@@ -116,15 +130,20 @@ def frame_to_base64(frame):
 
 def capture_frame(camera_stream):
     """Capture frame from camera stream"""
-    frame = camera_stream.read()
+    # Try up to 3 times with a short delay between attempts
+    for attempt in range(3):
+        frame = camera_stream.read()
+        if frame is not None:
+            # Create a copy for display
+            display_frame = frame.copy()
+            return frame, display_frame
+        
+        if attempt < 2:  # Don't sleep on last attempt
+            print(f"⚠️ Frame capture attempt {attempt + 1} failed, retrying...")
+            time.sleep(1)
     
-    if frame is None:
-        print("❌ Failed to get frame from stream")
-        return None, None
-    
-    # Create a copy for display
-    display_frame = frame.copy()
-    return frame, display_frame
+    print("❌ Failed to get frame from stream after 3 attempts")
+    return None, None
 
 def analyze_with_openai(frame):
     """Analyze frame with OpenAI"""
@@ -140,7 +159,7 @@ def analyze_with_openai(frame):
         system_prompt = """You are an industrial vision monitoring system. Analyze the image to detect serial numbers on blocks and map them to their EXACT PHYSICAL LOCATION in 3 slots.
 
 **CRITICAL SPATIAL POSITIONING**:
-The image shows 3 vertical slots separated by black lines. You must determine the EXACT LOCATION of each block:
+The image shows 3 vertical slots separated by white lines. You must determine the EXACT LOCATION of each block:
 
 **SLOT MAPPING (CRITICAL)**:
 - **slot_0** = LEFTMOST position (far left of image)
@@ -190,12 +209,12 @@ Return ONLY this JSON format:
 - Block "742" in RIGHT third → {"slot_0": null, "slot_1": null, "slot_2": "742"}
 - Blocks in LEFT and MIDDLE → {"slot_0": "XXX", "slot_1": "YYY", "slot_2": null}
 
-Look at each block's position relative to the black dividing lines and map accordingly.
+Look at each block's position relative to the white dividing lines and map accordingly.
 
 Return ONLY the JSON."""
 
         response = client.chat.completions.create(
-            model="gpt-4-vision-preview",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -222,73 +241,43 @@ Return ONLY the JSON."""
         return None
 
 def check_violations(result):
-    """Check for violations and return alarm details"""
+    """Check for violations in slot contents"""
+    violations = []
     expected_serials = {
-        "slot_0": "685",
-        "slot_1": "923", 
-        "slot_2": "742"
+        'slot_0': '685',
+        'slot_1': '923',
+        'slot_2': '742'
     }
     
-    violations = []
-    
-    for slot, detected in result.items():
-        expected = expected_serials[slot]
-        
-        if detected is None:
-            # Slot is vacant - this is allowed
-            continue
-        elif detected == expected:
-            # Correct serial number - no violation
-            continue
-        else:
-            # Wrong serial number - violation!
+    for slot, value in result.items():
+        if value is None:
+            continue  # Skip empty slots
+        if value != expected_serials[slot]:
             violations.append({
-                "slot": slot,
-                "expected": expected,
-                "detected": detected,
-                "reason": f"{slot} has wrong serial '{detected}' (expected '{expected}')"
+                'slot': slot,
+                'found': value,
+                'expected': expected_serials[slot]
             })
     
-    return violations
-
-def update_display(frame, result, violations):
-    """Update display with analysis results"""
-    if frame is None:
-        return
-    
-    display_frame = frame.copy()
-    height, width = display_frame.shape[:2]
-    slot_width = width // 3
-    
-    # Draw results for each slot
-    for i, (slot, value) in enumerate(result.items()):
-        # Calculate position for text
-        x = (i * slot_width) + (slot_width // 2) - 100
-        y = 70  # Position below timestamp
-        
-        # Determine status color
+    # Update status window based on results
+    colors = []
+    texts = []
+    for slot in ['slot_0', 'slot_1', 'slot_2']:
+        value = result.get(slot)
         if value is None:
-            status = "VACANT"
-            color = (255, 255, 0)  # Yellow
-        elif any(v["slot"] == slot for v in violations):
-            status = f"WRONG: {value}"
-            color = (0, 0, 255)    # Red
+            colors.append('white')
+            texts.append('empty')
+        elif any(v['slot'] == slot for v in violations):
+            colors.append('red')
+            texts.append(f'wrong: {value}')
         else:
-            status = f"OK: {value}"
-            color = (0, 255, 0)    # Green
-            
-        # Draw status
-        cv2.putText(display_frame, 
-                   status,
-                   (x, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX,
-                   0.8,
-                   color,
-                   2)
+            colors.append('green')
+            texts.append(f'ok: {value}')
     
-    # Show updated frame
-    cv2.imshow(display_window_name, display_frame)
-    cv2.waitKey(1)  # Update display
+    # Update status window
+    create_status_window(colors, texts)
+    
+    return violations
 
 def raise_alarm(violations, timestamp):
     """Raise alarm for violations"""
@@ -320,6 +309,57 @@ def log_status(timestamp, result, violations):
                 slot_status.append(f"{slot}:{value}")
         print(f"             Slots: {' | '.join(slot_status)}")
 
+def create_status_window(colors, texts):
+    """
+    Create a window showing status of each slot with colored circles and text
+    
+    Args:
+        colors: List of 3 colors for circles ('red', 'green', or 'white')
+        texts: List of 3 texts to display under circles
+    """
+    # Create a black background
+    height = 400
+    width = 900
+    image = np.zeros((height, width, 3), dtype=np.uint8)  # Black background
+    
+    # Calculate dimensions
+    circle_radius = 50
+    slot_width = width // 3
+    circle_y = height // 3
+    text_y = circle_y + circle_radius + 40
+    
+    # Color mapping
+    color_map = {
+        'red': (0, 0, 255),     # BGR format
+        'green': (0, 255, 0),   # BGR format
+        'white': (255, 255, 255) # BGR format
+    }
+    
+    # Draw white vertical lines between slots
+    for i in range(1, 3):
+        x = i * slot_width
+        cv2.line(image, (x, 0), (x, height), (255, 255, 255), 2)  # White lines
+    
+    # Draw circles and text for each slot
+    for i in range(3):
+        # Calculate center x position for this slot
+        center_x = (slot_width // 2) + (i * slot_width)
+        
+        # Draw circle
+        color = color_map.get(colors[i], (0, 0, 255))  # Default to red if invalid color
+        cv2.circle(image, (center_x, circle_y), circle_radius, color, -1)
+        
+        # Draw text in white
+        text = texts[i]
+        # Get text size to center it
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = center_x - (text_size[0] // 2)
+        cv2.putText(image, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)  # White text
+    
+    # Display the window
+    cv2.imshow(status_window_name, image)
+    cv2.waitKey(1)
+
 def continuous_monitor():
     """Main continuous monitoring loop"""
     global camera_stream  # Use global reference
@@ -338,18 +378,23 @@ def continuous_monitor():
     print("⏹️  Press Ctrl+C to stop monitoring")
     print("=" * 60)
     
+    # Create initial status window
+    initial_colors = ['red', 'green', 'red']
+    initial_texts = ['wrong container', 'empty container', 'wrong container']
+    create_status_window(initial_colors, initial_texts)
+    
     monitoring_count = 0
     
     try:
         # Start camera stream
-        camera_stream = CameraStream(camera_index=0)
+        camera_stream = CameraStream(camera_index=1)
         camera_stream.start()
         
         while monitoring_active:
+            monitoring_count += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             try:
-                monitoring_count += 1
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
                 print(f"\n📸 Monitor cycle #{monitoring_count} at {timestamp}")
                 
                 # Step 1: Capture frame
@@ -357,7 +402,7 @@ def continuous_monitor():
                 if frame is None:
                     print("❌ Frame capture failed, skipping cycle")
                     if monitoring_active:  # Check if we should continue waiting
-                        time.sleep(10)
+                        time.sleep(1)
                     continue
                 
                 print("✅ Frame captured")
@@ -367,17 +412,13 @@ def continuous_monitor():
                 if not result:
                     print("❌ OpenAI analysis failed, skipping cycle")
                     if monitoring_active:  # Check if we should continue waiting
-                        time.sleep(10)
+                        time.sleep(1)
                     continue
                 
                 # Step 3: Check for violations
                 violations = check_violations(result)
                 
-                # Step 4: Update display with results
-                if monitoring_active:  # Only update display if still running
-                    update_display(display_frame, result, violations)
-                
-                # Step 5: Log status and handle alarms
+                # Step 4: Log status and handle alarms
                 log_status(timestamp, result, violations)
                 
                 if violations:
@@ -386,22 +427,22 @@ def continuous_monitor():
                 # Wait 10 seconds before next cycle
                 if monitoring_active:
                     print("⏳ Waiting 10 seconds for next cycle...")
-                    time.sleep(10)
+                    time.sleep(1)
                     
             except Exception as e:
                 print(f"❌ Error in monitoring cycle: {str(e)}")
                 if monitoring_active:  # Check if we should continue waiting
                     print("⏳ Waiting 10 seconds before retry...")
-                    time.sleep(10)
+                    time.sleep(1)
     
     finally:
         # Ensure cleanup happens even if an error occurs
         if camera_stream:
             camera_stream.stop()
         cv2.destroyAllWindows()
-    
-    print("\n🛑 Monitoring stopped.")
-    print("📊 Total monitoring cycles completed:", monitoring_count)
+        
+        print("\n🛑 Monitoring stopped.")
+        print("📊 Total monitoring cycles completed:", monitoring_count)
 
 if __name__ == "__main__":
     continuous_monitor() 
