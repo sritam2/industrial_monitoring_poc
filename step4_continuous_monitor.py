@@ -9,59 +9,125 @@ from datetime import datetime
 import time
 import signal
 import sys
+import threading
+import io
+from PIL import Image
 
 # Load environment variables
 load_dotenv()
 
-# Global variable for graceful shutdown
+# Global variables for graceful shutdown
 monitoring_active = True
+display_window_name = "Industrial Monitoring System"
+stream_window_name = "Live Camera Feed"
+camera_stream = None  # Global reference to camera stream
+
+class CameraStream:
+    def __init__(self, camera_index=0):
+        """Initialize camera stream thread"""
+        self.camera_index = camera_index
+        self.frame = None
+        self.stopped = False
+        self.lock = threading.Lock()
+        self.thread = None
+        
+    def start(self):
+        """Start the camera stream thread"""
+        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.thread.start()
+        return self
+        
+    def update(self):
+        """Update frames from camera"""
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        
+        if not cap.isOpened():
+            print("❌ Failed to open camera in stream thread")
+            self.stopped = True
+            return
+            
+        while not self.stopped:
+            ret, frame = cap.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame.copy()
+                
+                # Display frame in stream window
+                if not self.stopped:  # Check again before displaying
+                    cv2.imshow(stream_window_name, frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        self.stopped = True
+                        break
+            else:
+                print("❌ Failed to read frame in stream thread")
+                break
+                
+        cap.release()
+        cv2.destroyWindow(stream_window_name)
+        
+    def read(self):
+        """Read the current frame"""
+        with self.lock:
+            return None if self.frame is None else self.frame.copy()
+            
+    def stop(self):
+        """Stop the camera stream thread"""
+        self.stopped = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)  # Wait for thread to finish
+        cv2.destroyAllWindows()  # Ensure all windows are closed
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully"""
-    global monitoring_active
+    global monitoring_active, camera_stream
     print("\n🛑 Shutdown signal received. Stopping monitoring...")
     monitoring_active = False
+    
+    # Stop the camera stream if it exists
+    if camera_stream:
+        camera_stream.stop()
+    
+    # Ensure all windows are closed
+    cv2.destroyAllWindows()
+    
+    # Force exit if cleanup takes too long
+    time.sleep(1)
+    sys.exit(0)
 
 # Set up signal handler for graceful shutdown
 signal.signal(signal.SIGINT, signal_handler)
 
-def capture_image():
-    """Capture image from camera"""
-    camera_index = 1
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+def frame_to_base64(frame):
+    """Convert OpenCV frame to base64 string"""
+    # Convert from BGR to RGB
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     
-    if not cap.isOpened():
-        print("❌ Failed to open camera")
-        return None
+    # Convert to PIL Image
+    pil_image = Image.fromarray(rgb_frame)
     
-    ret, frame = cap.read()
+    # Save to bytes buffer
+    buffer = io.BytesIO()
+    pil_image.save(buffer, format='JPEG')
     
-    if not ret:
-        print("❌ Failed to capture frame")
-        cap.release()
-        return None
-    
-    # Generate timestamped filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"monitor_{timestamp}.jpg"
-    
-    # Save image
-    success = cv2.imwrite(filename, frame)
-    cap.release()
-    
-    if success:
-        return filename
-    else:
-        print("❌ Failed to save image")
-        return None
+    # Get base64 string
+    base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    return base64_image
 
-def encode_image(image_path):
-    """Encode image to base64"""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+def capture_frame(camera_stream):
+    """Capture frame from camera stream"""
+    frame = camera_stream.read()
+    
+    if frame is None:
+        print("❌ Failed to get frame from stream")
+        return None, None
+    
+    # Create a copy for display
+    display_frame = frame.copy()
+    return frame, display_frame
 
-def analyze_with_openai(image_path):
-    """Analyze image with OpenAI"""
+def analyze_with_openai(frame):
+    """Analyze frame with OpenAI"""
     try:
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
@@ -69,7 +135,7 @@ def analyze_with_openai(image_path):
             return None
         
         client = OpenAI(api_key=api_key)
-        base64_image = encode_image(image_path)
+        base64_image = frame_to_base64(frame)
         
         system_prompt = """You are an industrial vision monitoring system. Analyze the image to detect serial numbers on blocks and map them to their EXACT PHYSICAL LOCATION in 3 slots.
 
@@ -129,7 +195,7 @@ Look at each block's position relative to the black dividing lines and map accor
 Return ONLY the JSON."""
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4-vision-preview",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {
@@ -152,7 +218,7 @@ Return ONLY the JSON."""
         return json.loads(ai_response)
         
     except Exception as e:
-        print(f"❌ OpenAI analysis failed: {str(e)}")
+        print(f"❌ OpenAI analysis error: {str(e)}")
         return None
 
 def check_violations(result):
@@ -184,6 +250,45 @@ def check_violations(result):
             })
     
     return violations
+
+def update_display(frame, result, violations):
+    """Update display with analysis results"""
+    if frame is None:
+        return
+    
+    display_frame = frame.copy()
+    height, width = display_frame.shape[:2]
+    slot_width = width // 3
+    
+    # Draw results for each slot
+    for i, (slot, value) in enumerate(result.items()):
+        # Calculate position for text
+        x = (i * slot_width) + (slot_width // 2) - 100
+        y = 70  # Position below timestamp
+        
+        # Determine status color
+        if value is None:
+            status = "VACANT"
+            color = (255, 255, 0)  # Yellow
+        elif any(v["slot"] == slot for v in violations):
+            status = f"WRONG: {value}"
+            color = (0, 0, 255)    # Red
+        else:
+            status = f"OK: {value}"
+            color = (0, 255, 0)    # Green
+            
+        # Draw status
+        cv2.putText(display_frame, 
+                   status,
+                   (x, y), 
+                   cv2.FONT_HERSHEY_SIMPLEX,
+                   0.8,
+                   color,
+                   2)
+    
+    # Show updated frame
+    cv2.imshow(display_window_name, display_frame)
+    cv2.waitKey(1)  # Update display
 
 def raise_alarm(violations, timestamp):
     """Raise alarm for violations"""
@@ -217,13 +322,17 @@ def log_status(timestamp, result, violations):
 
 def continuous_monitor():
     """Main continuous monitoring loop"""
-    print("🎯 Step 4: Continuous Slot Monitoring System")
+    global camera_stream  # Use global reference
+    
+    print("🎯 Step 5: Continuous Slot Monitoring System with Display")
     print("=" * 60)
     print("📊 Monitoring Configuration:")
     print("   - Frequency: Every 10 seconds")
     print("   - Expected serials: slot_0='685', slot_1='923', slot_2='742'")
     print("   - Camera: Index 1 (Logitech)")
-    print("   - Analysis: OpenAI GPT-4o-mini")
+    print("   - Analysis: OpenAI GPT-4-vision-preview")
+    print("   - Display: Real-time camera feed with status overlay")
+    print("   - Stream: Independent camera feed window")
     print("=" * 60)
     print("🚀 Starting continuous monitoring...")
     print("⏹️  Press Ctrl+C to stop monitoring")
@@ -231,66 +340,68 @@ def continuous_monitor():
     
     monitoring_count = 0
     
-    while monitoring_active:
-        try:
-            monitoring_count += 1
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            print(f"\n📸 Monitor cycle #{monitoring_count} at {timestamp}")
-            
-            # Step 1: Capture image
-            image_path = capture_image()
-            if not image_path:
-                print("❌ Image capture failed, skipping cycle")
-                time.sleep(10)
-                continue
-            
-            print(f"✅ Image captured: {image_path}")
-            
-            # Step 2: Analyze with OpenAI
-            result = analyze_with_openai(image_path)
-            if not result:
-                print("❌ OpenAI analysis failed, skipping cycle")
-                time.sleep(10)
-                continue
-            
-            # Step 3: Check for violations
-            violations = check_violations(result)
-            
-            # Step 4: Log status and handle alarms
-            log_status(timestamp, result, violations)
-            
-            if violations:
-                raise_alarm(violations, timestamp)
-            
-            # Clean up old image files (keep only last 5)
-            cleanup_old_images()
-            
-            # Wait 10 seconds before next cycle
-            if monitoring_active:
-                print("⏳ Waiting 10 seconds for next cycle...")
-                time.sleep(10)
+    try:
+        # Start camera stream
+        camera_stream = CameraStream(camera_index=0)
+        camera_stream.start()
+        
+        while monitoring_active:
+            try:
+                monitoring_count += 1
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"❌ Error in monitoring cycle: {str(e)}")
-            print("⏳ Waiting 10 seconds before retry...")
-            time.sleep(10)
+                print(f"\n📸 Monitor cycle #{monitoring_count} at {timestamp}")
+                
+                # Step 1: Capture frame
+                frame, display_frame = capture_frame(camera_stream)
+                if frame is None:
+                    print("❌ Frame capture failed, skipping cycle")
+                    if monitoring_active:  # Check if we should continue waiting
+                        time.sleep(10)
+                    continue
+                
+                print("✅ Frame captured")
+                
+                # Step 2: Analyze with OpenAI
+                result = analyze_with_openai(frame)
+                if not result:
+                    print("❌ OpenAI analysis failed, skipping cycle")
+                    if monitoring_active:  # Check if we should continue waiting
+                        time.sleep(10)
+                    continue
+                
+                # Step 3: Check for violations
+                violations = check_violations(result)
+                
+                # Step 4: Update display with results
+                if monitoring_active:  # Only update display if still running
+                    update_display(display_frame, result, violations)
+                
+                # Step 5: Log status and handle alarms
+                log_status(timestamp, result, violations)
+                
+                if violations:
+                    raise_alarm(violations, timestamp)
+                
+                # Wait 10 seconds before next cycle
+                if monitoring_active:
+                    print("⏳ Waiting 10 seconds for next cycle...")
+                    time.sleep(10)
+                    
+            except Exception as e:
+                print(f"❌ Error in monitoring cycle: {str(e)}")
+                if monitoring_active:  # Check if we should continue waiting
+                    print("⏳ Waiting 10 seconds before retry...")
+                    time.sleep(10)
+    
+    finally:
+        # Ensure cleanup happens even if an error occurs
+        if camera_stream:
+            camera_stream.stop()
+        cv2.destroyAllWindows()
     
     print("\n🛑 Monitoring stopped.")
     print("📊 Total monitoring cycles completed:", monitoring_count)
-
-def cleanup_old_images():
-    """Keep only the last 5 monitoring images"""
-    try:
-        image_files = [f for f in os.listdir('.') if f.startswith('monitor_') and f.endswith('.jpg')]
-        if len(image_files) > 5:
-            image_files.sort()
-            for old_file in image_files[:-5]:
-                os.remove(old_file)
-    except Exception as e:
-        pass  # Silent cleanup failure
 
 if __name__ == "__main__":
     continuous_monitor() 
